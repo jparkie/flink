@@ -27,6 +27,8 @@ import org.apache.flink.streaming.api.functions.sink.RichSinkFunction;
 
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.exceptions.BusyPoolException;
+import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -47,7 +49,6 @@ public abstract class CassandraSinkBase<IN, V> extends RichSinkFunction<IN> impl
 	protected transient Session session;
 
 	protected transient volatile Throwable exception;
-	protected transient FutureCallback<V> callback;
 
 	private final ClusterBuilder builder;
 
@@ -60,30 +61,6 @@ public abstract class CassandraSinkBase<IN, V> extends RichSinkFunction<IN> impl
 
 	@Override
 	public void open(Configuration configuration) {
-		this.callback = new FutureCallback<V>() {
-			@Override
-			public void onSuccess(V ignored) {
-				int pending = updatesPending.decrementAndGet();
-				if (pending == 0) {
-					synchronized (updatesPending) {
-						updatesPending.notifyAll();
-					}
-				}
-			}
-
-			@Override
-			public void onFailure(Throwable t) {
-				int pending = updatesPending.decrementAndGet();
-				if (pending == 0) {
-					synchronized (updatesPending) {
-						updatesPending.notifyAll();
-					}
-				}
-				exception = t;
-
-				log.error("Error while sending value.", t);
-			}
-		};
 		this.cluster = builder.getCluster();
 		this.session = createSession();
 	}
@@ -97,7 +74,7 @@ public abstract class CassandraSinkBase<IN, V> extends RichSinkFunction<IN> impl
 		checkAsyncErrors();
 		ListenableFuture<V> result = send(value);
 		updatesPending.incrementAndGet();
-		Futures.addCallback(result, callback);
+		Futures.addCallback(result, new RetryFutureCallback(value));
 	}
 
 	public abstract ListenableFuture<V> send(IN value);
@@ -157,5 +134,52 @@ public abstract class CassandraSinkBase<IN, V> extends RichSinkFunction<IN> impl
 	@VisibleForTesting
 	int getNumOfPendingRecords() {
 		return updatesPending.get();
+	}
+
+	private class RetryFutureCallback implements FutureCallback<V> {
+		private final IN value;
+
+		RetryFutureCallback(IN value) {
+			this.value = value;
+		}
+
+		@Override
+		public void onSuccess(V ignored) {
+			int pending = updatesPending.decrementAndGet();
+			if (pending == 0) {
+				synchronized (updatesPending) {
+					updatesPending.notifyAll();
+				}
+			}
+		}
+
+		@Override
+		public void onFailure(Throwable throwable) {
+			if (isSafeToRetry(throwable)) {
+				log.warn("Retrying on error to send value.", throwable);
+				Futures.addCallback(send(value), this);
+			} else {
+				int pending = updatesPending.decrementAndGet();
+				if (pending == 0) {
+					synchronized (updatesPending) {
+						updatesPending.notifyAll();
+					}
+				}
+				exception = throwable;
+
+				log.error("Error while sending value.", throwable);
+			}
+		}
+
+		private boolean isSafeToRetry(Throwable throwable) {
+			if (throwable instanceof NoHostAvailableException) {
+				NoHostAvailableException noHostAvailableException = (NoHostAvailableException) throwable;
+				return noHostAvailableException.getErrors()
+					.values()
+					.stream()
+					.anyMatch(e -> e instanceof BusyPoolException);
+			}
+			return false;
+		}
 	}
 }

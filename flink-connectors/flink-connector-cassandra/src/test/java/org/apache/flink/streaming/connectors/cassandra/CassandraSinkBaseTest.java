@@ -28,12 +28,16 @@ import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.ResultSetFuture;
 import com.datastax.driver.core.Session;
+import com.datastax.driver.core.exceptions.BusyPoolException;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.google.common.util.concurrent.ListenableFuture;
 import org.junit.Assert;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.util.Collections;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 
 import static org.mockito.Mockito.mock;
@@ -209,6 +213,23 @@ public class CassandraSinkBaseTest {
 		Assert.assertEquals(0, casSinkFunc.getNumOfPendingRecords());
 	}
 
+	@Test(timeout = 5000)
+	public void testRetryOnBusyPoolException() throws Exception {
+		BusyPoolExceptionCassandraSink casSinkFunc = new BusyPoolExceptionCassandraSink(5);
+
+		casSinkFunc.open(new Configuration());
+
+		try {
+			casSinkFunc.invoke("hello");
+
+			Assert.assertEquals(0, casSinkFunc.getNumOfPendingRecords());
+
+			casSinkFunc.close();
+		} catch (BusyPoolException e) {
+			Assert.fail("BusyPoolException should not have been thrown.");
+		}
+	}
+
 	private static class TestCassandraSink extends CassandraSinkBase<String, ResultSet> {
 
 		private static final ClusterBuilder builder;
@@ -243,6 +264,46 @@ public class CassandraSinkBaseTest {
 		@Override
 		public ListenableFuture<ResultSet> send(String value) {
 			return result;
+		}
+	}
+
+	private static class BusyPoolExceptionCassandraSink extends CassandraSinkBase<String, ResultSet> {
+
+		private static final ClusterBuilder builder;
+		private static final Cluster cluster;
+		private static final Session session;
+
+		static {
+			cluster = mock(Cluster.class);
+			session = mock(Session.class);
+			when(cluster.connect()).thenReturn(session);
+			builder = new ClusterBuilder() {
+				@Override
+				protected Cluster buildCluster(Cluster.Builder builder) {
+					return cluster;
+				}
+			};
+		}
+
+		private int exceptionCount;
+
+		BusyPoolExceptionCassandraSink(int exceptionCount) {
+			super(builder);
+			this.exceptionCount = exceptionCount;
+		}
+
+		@Override
+		public ListenableFuture<ResultSet> send(String value) {
+			if (exceptionCount > 0) {
+				exceptionCount--;
+				final InetSocketAddress errorKey = InetSocketAddress.createUnresolved("127.0.0.1", 9042);
+				final BusyPoolException errorValue = new BusyPoolException(errorKey, 1);
+				final Map<InetSocketAddress, Throwable> errors = Collections.singletonMap(errorKey, errorValue);
+				final NoHostAvailableException cause = new NoHostAvailableException(errors);
+				return ResultSetFutures.fromCompletableFuture(FutureUtils.getFailedFuture(cause));
+			} else {
+				return ResultSetFutures.fromCompletableFuture(CompletableFuture.completedFuture(null));
+			}
 		}
 	}
 }
